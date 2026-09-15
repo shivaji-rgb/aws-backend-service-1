@@ -11,7 +11,7 @@ public class HomeController {
 	
 	@GetMapping("/")
 	public String getLogin() {
-		return "My spring boot app inside the private server";	}
+		return "My spring boot app inside the private server from here";	}
 
 
 }

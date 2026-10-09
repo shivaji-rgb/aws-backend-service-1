@@ -1,13 +1,24 @@
 package com.cloud.controller;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.cloud.dto.request.RegisterUserRequest;
+import com.cloud.entity.users.Users;
+import com.cloud.service.UserService;
+
+import jakarta.validation.Valid;
+
 @RestController
 public class LoginController {
+	
+	@Autowired
+	private UserService service;
 
 	@PostMapping("/login")
 	public ResponseEntity<LoginResponse> login(@RequestBody LoginRequest request) {
@@ -25,4 +36,15 @@ public class LoginController {
 
 	public record LoginResponse(boolean authenticated, String message) {
 	}
+	
+	@PostMapping("/register")
+	public ResponseEntity registerUser(@RequestBody @Valid RegisterUserRequest req) {
+		
+	
+		
+		return ResponseEntity.status(HttpStatus.CREATED)
+	            .body(service.registerUser(req));
+		
+	}
+	
 }

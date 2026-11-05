@@ -1,12 +1,13 @@
 
-name: FreshDrop Java CI-CD
+name: FreshDrop Java Spring Boot CI-CD
 
 on:
-  # Enable automatic deployment after pushing to main when ready.
+  workflow_dispatch:
+
+  # Uncomment to deploy automatically on every push to main.
   # push:
   #   branches:
   #     - main
-  workflow_dispatch:
 
 permissions:
   id-token: write
@@ -16,249 +17,460 @@ env:
   AWS_REGION: us-east-1
   S3_BUCKET: shiva-app-s3-java-jars
   S3_KEY: myapp/app.jar
+  SECRET_NAME: uat/myapp/mysql
 
 jobs:
+
   build-and-deploy:
+
+    name: Build and Deploy Spring Boot Application
     runs-on: ubuntu-latest
 
     steps:
 
-      # 1. Checkout source code
-      - name: Checkout code
+      # ------------------------------------------------
+      # STEP 1: Checkout source code
+      # ------------------------------------------------
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Setup Java 21
-      - name: Setup Java 21
+      # ------------------------------------------------
+      # STEP 2: Configure Java 21
+      # ------------------------------------------------
+
+      - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
+          cache-dependency-path: pom.xml
 
-      # 3. Build Spring Boot application
-      # Temporarily skip test compilation and execution
-      - name: Build application
-        run: mvn -B clean package -Dmaven.test.skip=true
+      # ------------------------------------------------
+      # STEP 3: Build Spring Boot application
+      # ------------------------------------------------
 
-      # 4. Prepare executable JAR
-      - name: Prepare JAR
+      - name: Build Spring Boot JAR
         run: |
-          JAR_FILE=$(find target -maxdepth 1 \
-            -type f -name '*.jar' \
-            ! -name '*.jar.original' \
-            ! -name '*-plain.jar' \
-            ! -name '*-sources.jar' \
-            ! -name '*-javadoc.jar' | head -n 1)
+          set -euo pipefail
 
-          if [ -z "$JAR_FILE" ]; then
-            echo "No executable Spring Boot JAR found!"
+          echo "Java version:"
+          java -version
+
+          echo "Maven version:"
+          mvn -version
+
+          echo "Building Spring Boot application..."
+
+          mvn -B clean package -Dmaven.test.skip=true
+
+          echo "Build completed successfully."
+
+      # ------------------------------------------------
+      # STEP 4: Prepare executable JAR
+      # ------------------------------------------------
+
+      - name: Prepare application JAR
+        run: |
+          set -euo pipefail
+
+          mkdir -p deployment
+
+          mapfile -t JARS < <(
+            find target \
+              -maxdepth 1 \
+              -type f \
+              -name '*.jar' \
+              ! -name '*.jar.original' \
+              ! -name '*-plain.jar' \
+              ! -name '*-sources.jar' \
+              ! -name '*-javadoc.jar' \
+              ! -name '*-tests.jar'
+          )
+
+          if [ "${#JARS[@]}" -ne 1 ]; then
+            echo "Expected exactly one executable JAR."
+            echo "Found ${#JARS[@]} candidate JAR files."
+            ls -lh target/*.jar || true
             exit 1
           fi
 
-          cp "$JAR_FILE" app.jar
+          cp "${JARS[0]}" deployment/app.jar
 
-          echo "JAR prepared:"
-          ls -lh app.jar
+          echo "Prepared executable JAR:"
+          ls -lh deployment/app.jar
 
-      # 5. Authenticate to AWS using GitHub OIDC
+      # ------------------------------------------------
+      # STEP 5: Authenticate AWS using GitHub OIDC
+      # ------------------------------------------------
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::810305107532:role/githubActions-role
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: us-east-1
           audience: sts.amazonaws.com
 
-      # 6. Verify AWS identity
-      - name: Verify AWS identity
-        run: aws sts get-caller-identity
+      # ------------------------------------------------
+      # STEP 6: Verify AWS identity
+      # ------------------------------------------------
 
-      # 7. Upload JAR to S3
+      - name: Verify AWS authentication
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity
+
+      # ------------------------------------------------
+      # STEP 7: Upload JAR to S3
+      # ------------------------------------------------
+
       - name: Upload JAR to S3
         run: |
-          aws s3 cp app.jar \
-            s3://${S3_BUCKET}/${S3_KEY} \
+          set -euo pipefail
+
+          echo "Uploading application JAR to S3..."
+
+          aws s3 cp \
+            deployment/app.jar \
+            "s3://${S3_BUCKET}/${S3_KEY}" \
             --region "$AWS_REGION"
 
-          echo "JAR uploaded successfully!"
+          echo "S3 upload completed."
 
-      # 8. Prepare deployment script for SSM
-      - name: Prepare SSM deployment script
+      # ------------------------------------------------
+      # STEP 8: Create remote deployment script
+      # ------------------------------------------------
+
+      - name: Create EC2 deployment script
         run: |
-          cat > remote-deploy.sh <<'REMOTE'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
+          cat > remote-deploy.sh <<'REMOTE_SCRIPT'
+          #!/bin/bash
 
-          REGION="us-east-1"
-          BUCKET="shiva-app-s3-java-jars"
+          set -euo pipefail
+
+          AWS_REGION="us-east-1"
+          S3_BUCKET="shiva-app-s3-java-jars"
           S3_KEY="myapp/app.jar"
           SECRET_NAME="uat/myapp/mysql"
 
           APP_DIR="/opt/myapp"
           CONFIG_DIR="/etc/myapp"
+          APP_JAR="${APP_DIR}/app.jar"
 
           echo "Starting FreshDrop deployment..."
 
-          # SSM RunShellScript normally executes as root on Linux.
-          if [ "$(id -u)" -ne 0 ]; then
-            echo "Deployment script must run as root."
+          # --------------------------------------------
+          # STEP 8.1: Detect Linux distribution
+          # --------------------------------------------
+
+          source /etc/os-release
+
+          echo "Operating system: ${PRETTY_NAME:-$ID}"
+
+          # --------------------------------------------
+          # STEP 8.2: Install required packages
+          # --------------------------------------------
+
+          if ! command -v java >/dev/null 2>&1 ||
+             ! command -v aws >/dev/null 2>&1 ||
+             ! command -v python3 >/dev/null 2>&1; then
+
+            echo "Installing missing dependencies..."
+
+            case "$ID" in
+
+              amzn)
+                if command -v dnf >/dev/null 2>&1; then
+                  dnf install -y \
+                    java-21-amazon-corretto-headless \
+                    awscli \
+                    python3
+                else
+                  yum install -y \
+                    java-21-amazon-corretto-headless \
+                    awscli \
+                    python3
+                fi
+                ;;
+
+              ubuntu|debian)
+                apt-get update
+
+                apt-get install -y \
+                  openjdk-21-jre-headless \
+                  awscli \
+                  python3
+                ;;
+
+              *)
+                echo "Unsupported Linux distribution: $ID"
+                exit 1
+                ;;
+            esac
+
+          fi
+
+          # --------------------------------------------
+          # STEP 8.3: Verify Java 21
+          # --------------------------------------------
+
+          if ! command -v java >/dev/null 2>&1; then
+            echo "Java installation failed."
             exit 1
           fi
 
-          # Detect EC2 operating-system service user.
-          if id ec2-user >/dev/null 2>&1; then
-            SERVICE_USER="ec2-user"
-          elif id ubuntu >/dev/null 2>&1; then
-            SERVICE_USER="ubuntu"
-          else
-            echo "Neither ec2-user nor ubuntu exists."
-            echo "Configure the correct Linux service user."
-            exit 1
-          fi
-
-          # Check Java installation.
-          JAVA_BIN="$(command -v java || true)"
-
-          if [ -z "$JAVA_BIN" ]; then
-            echo "Java is not installed on EC2."
-            exit 1
-          fi
-
+          echo "Installed Java version:"
           java -version
 
-          # Create application and configuration directories.
-          install -d -m 755 "$APP_DIR"
-          install -d -m 700 "$CONFIG_DIR"
+          JAVA_VERSION=$(
+            java -XshowSettings:properties -version 2>&1 |
+            awk -F'= ' '/java.specification.version/ {print $2; exit}'
+          )
 
-          TEMP_DIR="$(mktemp -d)"
-          trap 'rm -rf "$TEMP_DIR"' EXIT
+          if [ "$JAVA_VERSION" != "21" ]; then
+            echo "Java 21 is required. Found: $JAVA_VERSION"
+            exit 1
+          fi
 
-          # Download new JAR from S3.
-          echo "Downloading application JAR..."
+          echo "Java 21 verification successful."
+
+          # --------------------------------------------
+          # STEP 8.4: Verify AWS CLI and Python
+          # --------------------------------------------
+
+          command -v aws
+          command -v python3
+
+          aws --version
+
+          # --------------------------------------------
+          # STEP 8.5: Create application directories
+          # --------------------------------------------
+
+          mkdir -p "$APP_DIR"
+          mkdir -p "$CONFIG_DIR"
+
+          # Create dedicated Linux application user.
+
+          if ! id myapp >/dev/null 2>&1; then
+
+            NOLOGIN=$(command -v nologin || echo /sbin/nologin)
+
+            useradd \
+              --system \
+              --home-dir "$APP_DIR" \
+              --shell "$NOLOGIN" \
+              myapp
+
+          fi
+
+          # --------------------------------------------
+          # STEP 8.6: Download JAR from S3
+          # --------------------------------------------
+
+          echo "Downloading application JAR from S3..."
+
+          TEMP_JAR="${APP_DIR}/app.jar.tmp"
 
           aws s3 cp \
-            "s3://${BUCKET}/${S3_KEY}" \
-            "$TEMP_DIR/app.jar" \
-            --region "$REGION"
+            "s3://${S3_BUCKET}/${S3_KEY}" \
+            "$TEMP_JAR" \
+            --region "$AWS_REGION"
 
-          # Retrieve database credentials from Secrets Manager.
+          mv "$TEMP_JAR" "$APP_JAR"
+
+          chown myapp:myapp "$APP_JAR"
+          chmod 644 "$APP_JAR"
+
+          echo "Application JAR downloaded."
+
+          # --------------------------------------------
+          # STEP 8.7: Retrieve DB credentials
+          # from AWS Secrets Manager
+          # --------------------------------------------
+
           echo "Retrieving database configuration..."
 
-          SECRET_JSON="$(aws secretsmanager get-secret-value \
-            --secret-id "$SECRET_NAME" \
-            --region "$REGION" \
-            --query SecretString \
-            --output text)"
+          SECRET_JSON=$(
+            aws secretsmanager get-secret-value \
+              --secret-id "$SECRET_NAME" \
+              --query SecretString \
+              --output text \
+              --region "$AWS_REGION"
+          )
 
-          # Convert JSON credentials into a protected systemd env file.
+          if [ -z "$SECRET_JSON" ] || [ "$SECRET_JSON" = "None" ]; then
+            echo "Could not retrieve database secret."
+            exit 1
+          fi
+
           export SECRET_JSON
 
-          python3 - "$TEMP_DIR/myapp.env" <<'PY'
+          # --------------------------------------------
+          # STEP 8.8: Create protected environment file
+          # --------------------------------------------
+
+          python3 - <<'PYTHON_SCRIPT'
           import json
           import os
-          import sys
 
-          output_file = sys.argv[1]
-          data = json.loads(os.environ["SECRET_JSON"])
+          secret = json.loads(os.environ["SECRET_JSON"])
 
-          required = ["db_username", "db_password", "db_url"]
+          required = [
+              "db_username",
+              "db_password",
+              "db_url"
+          ]
 
           for key in required:
-              if not data.get(key):
-                  raise ValueError(f"Missing secret key: {key}")
+              if key not in secret or not isinstance(secret[key], str):
+                  raise ValueError(
+                      f"Missing or invalid secret key: {key}"
+                  )
 
-          values = {
-              "DB_USERNAME": data["db_username"],
-              "DB_PASSWORD": data["db_password"],
-              "DB_URL": data["db_url"]
-          }
+              if "\n" in secret[key] or "\r" in secret[key]:
+                  raise ValueError(
+                      f"Newlines are not allowed in {key}"
+                  )
 
-          def quote_systemd(value):
-              value = str(value)
+          def systemd_quote(value):
+              value = value.replace("\\", "\\\\")
+              value = value.replace('"', '\\"')
+              return f'"{value}"'
 
-              if "\n" in value or "\r" in value:
-                  raise ValueError("Newlines are not supported in DB environment values")
+          env_content = (
+              f"DB_USERNAME={systemd_quote(secret['db_username'])}\n"
+              f"DB_PASSWORD={systemd_quote(secret['db_password'])}\n"
+              f"DB_URL={systemd_quote(secret['db_url'])}\n"
+          )
 
-              return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+          with open("/etc/myapp/myapp.env", "w") as file:
+              file.write(env_content)
 
-          with open(output_file, "w") as f:
-              for key, value in values.items():
-                  f.write(f"{key}={quote_systemd(value)}\n")
+          os.chmod("/etc/myapp/myapp.env", 0o600)
 
-          os.chmod(output_file, 0o600)
-          PY
+          print("Database environment configuration created.")
+          PYTHON_SCRIPT
 
           unset SECRET_JSON
 
-          # Install new application and environment configuration.
-          mv "$TEMP_DIR/app.jar" "$APP_DIR/app.jar"
-          chmod 644 "$APP_DIR/app.jar"
+          # --------------------------------------------
+          # STEP 8.9: Create systemd service
+          # --------------------------------------------
 
-          install -m 600 \
-            "$TEMP_DIR/myapp.env" \
-            "$CONFIG_DIR/myapp.env"
+          JAVA_BIN=$(command -v java)
 
-          # Create systemd service dynamically.
-          echo "Creating systemd service..."
-
-          cat > /etc/systemd/system/myapp.service <<EOF
+          cat > /etc/systemd/system/myapp.service <<SERVICE_FILE
           [Unit]
           Description=FreshDrop Spring Boot Application
           After=network.target
 
           [Service]
           Type=simple
-          User=${SERVICE_USER}
-          WorkingDirectory=${APP_DIR}
-          Environment=SPRING_PROFILES_ACTIVE=prod
-          EnvironmentFile=${CONFIG_DIR}/myapp.env
-          ExecStart=${JAVA_BIN} -jar ${APP_DIR}/app.jar
-          Restart=always
+          User=myapp
+          WorkingDirectory=/opt/myapp
+
+          Environment="SPRING_PROFILES_ACTIVE=prod"
+          EnvironmentFile=/etc/myapp/myapp.env
+
+          ExecStart=${JAVA_BIN} -jar /opt/myapp/app.jar
+
+          Restart=on-failure
           RestartSec=10
+          SuccessExitStatus=143
+          TimeoutStartSec=120
+
+          NoNewPrivileges=true
+          PrivateTmp=true
 
           [Install]
           WantedBy=multi-user.target
-          EOF
+          SERVICE_FILE
 
-          # Reload systemd and restart application.
+          chmod 644 /etc/systemd/system/myapp.service
+
+          # --------------------------------------------
+          # STEP 8.10: Start application
+          # --------------------------------------------
+
+          echo "Starting Spring Boot application..."
+
           systemctl daemon-reload
+
           systemctl enable myapp
+
           systemctl restart myapp
 
-          # Wait for application service to become active.
-          echo "Waiting for Spring Boot service..."
+          # --------------------------------------------
+          # STEP 8.11: Verify service
+          # --------------------------------------------
 
           for i in $(seq 1 30); do
+
             if systemctl is-active --quiet myapp; then
-              echo "FreshDrop Spring Boot service is active!"
-              systemctl status myapp --no-pager
-              exit 0
+              echo "FreshDrop application is running!"
+              break
             fi
 
+            echo "Waiting for application startup..."
             sleep 2
+
           done
 
-          echo "Application failed to start."
+          if ! systemctl is-active --quiet myapp; then
 
-          journalctl -u myapp -n 80 --no-pager || true
+            echo "Application failed to start."
 
-          exit 1
-          REMOTE
+            systemctl status myapp --no-pager || true
 
-          # Convert the complete script into valid SSM JSON parameters.
-          python3 - <<'PY'
+            journalctl \
+              -u myapp \
+              -n 100 \
+              --no-pager || true
+
+            exit 1
+
+          fi
+
+          echo "----------------------------------"
+          echo "FreshDrop deployment completed."
+          echo "Application port: 9050"
+          echo "Systemd service: myapp"
+          echo "----------------------------------"
+
+          systemctl status myapp --no-pager
+
+          REMOTE_SCRIPT
+
+      # ------------------------------------------------
+      # STEP 9: Convert script into SSM JSON parameters
+      # ------------------------------------------------
+
+      - name: Prepare SSM parameters
+        run: |
+          python3 - <<'PYTHON_SCRIPT'
           import json
 
-          with open("remote-deploy.sh") as f:
-              script = f.read()
+          with open("remote-deploy.sh", "r") as file:
+              script = file.read()
 
-          with open("ssm-parameters.json", "w") as f:
-              json.dump({"commands": [script]}, f)
-          PY
+          with open("ssm-parameters.json", "w") as file:
+              json.dump(
+                  {"commands": [script]},
+                  file
+              )
+          PYTHON_SCRIPT
 
-      # 9. Deploy to private EC2 using SSM
+      # ------------------------------------------------
+      # STEP 10: Deploy through AWS SSM
+      # ------------------------------------------------
+
       - name: Deploy to private EC2
         env:
           EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+
         run: |
           set -euo pipefail
 
@@ -266,6 +478,8 @@ jobs:
             echo "EC2_INSTANCE_ID GitHub variable is missing!"
             exit 1
           fi
+
+          echo "Sending deployment command to EC2..."
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
@@ -278,7 +492,10 @@ jobs:
 
           echo "SSM Command ID: $COMMAND_ID"
 
-          # Wait for deployment result.
+          # ------------------------------------------
+          # Wait for SSM deployment result
+          # ------------------------------------------
+
           for i in $(seq 1 60); do
 
             STATUS=$(aws ssm get-command-invocation \
@@ -291,8 +508,18 @@ jobs:
             echo "Deployment status: $STATUS"
 
             if [ "$STATUS" = "Success" ]; then
-              echo "FreshDrop deployment successful!"
+
+              echo "Deployment successful!"
+
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$EC2_INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --query 'StandardOutputContent' \
+                --output text
+
               exit 0
+
             fi
 
             if [[ "$STATUS" == "Failed" ||
@@ -313,9 +540,11 @@ jobs:
                 --output json || true
 
               exit 1
+
             fi
 
             sleep 5
+
           done
 
           echo "Timed out waiting for SSM deployment."
